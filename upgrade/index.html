@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Asteroid Chain Reaction — 判定書き直し版</title>
+<style>
+  html,body{height:100%;margin:0;background:#05070b;display:flex;align-items:center;justify-content:center;font-family:system-ui;overflow:hidden;}
+  canvas{background:#0a121d;border-radius:8px;box-shadow:0 0 30px rgba(0,150,255,0.2);cursor:crosshair;}
+  #hud{position:fixed;top:12px;left:12px;color:#cfe7ff;font-size:18px;font-weight:600;text-shadow:0 0 10px rgba(0,150,255,0.5);pointer-events:none;}
+  #msg{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.8);padding:24px 36px;border-radius:12px;color:#fff;font-size:24px;text-align:center;display:none;border:2px solid #444;pointer-events:none;}
+</style>
+</head>
+<body>
+
+<canvas id="game" width="480" height="640"></canvas>
+<div id="hud">Score: 0</div>
+<div id="msg">GAME OVER<br><span style="font-size:14px">Click to Restart</span></div>
+
+<script>
+// ---------------- CONFIG ----------------
+// 衝突判定モード: "circle" または "rect"（rect は circle-rect 最近接点法）
+const COLLISION_MODE = "circle"; // 推奨: "circle"
+// プレイヤー円の半径（circle モードの当たり範囲。見た目に合わせて小さめに）
+const PLAYER_COLLISION_RADIUS = 18;
+
+// 衝突が有効になる「連続時間」(秒)。短すぎると誤判定、長すぎると反応鈍く。
+const HIT_CONFIRM_TIME = 0.06; // 60ms
+
+// デバッグ表示
+const DEBUG = true;
+
+// ---------------- 基本 ----------------
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const W = canvas.width, H = canvas.height;
+let last = 0, running = true;
+let score = 0;
+let gameOver = false;
+
+// 画像（任意）
+const imgRocket = new Image();
+const imgStone1 = new Image();
+const imgStone2 = new Image();
+imgRocket.src = "/images/rocket.png";
+imgStone1.src = "/images/inseki01.png";
+imgStone2.src = "/images/inseki02.png";
+
+// プレイヤー（描画は矩形中心だが判定はモードに依る）
+const player = {
+  x: W/2, y: H - 80,
+  w: 48, h: 48,
+  speed: 450,
+  powerUpTime: 0
+};
+
+// stones 配列の要素に以下を持たせる:
+// { x,y,r,vx,vy,rot,rotSpd,img,size,type,isHitted,_remove,hitTimer }
+// hitTimer: 当該フレームから何秒間継続して当たり状態か（連続時間）
+let stones = [];
+const stoneTypes = [
+  { img: imgStone1, size: 42, speedMin: 90, speedMax: 160, type:'normal' },
+  { img: imgStone2, size: 66, speedMin: 60, speedMax: 130, type:'normal' },
+  { img: null,    size: 30, speedMin: 180, speedMax: 240, type:'gold' }
+];
+
+function spawnStone(){
+  const r = Math.random();
+  const t = r < 0.12 ? 2 : (r < 0.6 ? 0 : 1);
+  const type = stoneTypes[t];
+  return {
+    x: Math.random() * (W - type.size) + type.size/2,
+    y: -type.size,
+    r: type.size/2,
+    vx: (Math.random()-0.5)*50,
+    vy: rand(type.speedMin, type.speedMax),
+    rot: Math.random()*Math.PI*2,
+    rotSpd: (Math.random()-0.5)*5,
+    img: type.img,
+    size: type.size,
+    type: type.type,
+    isHitted: false,
+    _remove: false,
+    hitTimer: 0 // ← ここが重要（当たり連続時間）
+  };
+}
+function rand(a,b){ return Math.random()*(b-a)+a; }
+
+// 入力
+const keys = {};
+window.addEventListener("keydown", e=>{ keys[e.key]=true; });
+window.addEventListener("keyup", e=>{ keys[e.key]=false; });
+canvas.addEventListener("mousemove", e=>{
+  const r = canvas.getBoundingClientRect();
+  const mx = (e.clientX - r.left) * (canvas.width / r.width);
+  player.x = mx;
+});
+canvas.addEventListener("mousedown", ()=>{ if(gameOver) restart(); });
+
+// リスタート
+function restart(){
+  stones = []; score = 0; player.powerUpTime = 0; gameOver = false;
+  document.getElementById("msg").style.display = "none"; last = performance.now(); running = true; loop(last);
+}
+
+// ---------------- 判定関数（きれい） ----------------
+
+// 1) 円-円（石 vs プレイヤー円）
+function circleCircleCollision(ax,ay,ar, bx,by,br){
+  const dx = ax-bx, dy = ay-by;
+  return (dx*dx + dy*dy) < (ar+br)*(ar+br);
+}
+
+// 2) 円-矩形（石 vs プレイヤー矩形）
+//  矩形は left,top,width,height
+function circleRectCollision(cx,cy,cr, rect){
+  // 矩形の最近接点を求める
+  const closestX = Math.max(rect.left, Math.min(cx, rect.left + rect.width));
+  const closestY = Math.max(rect.top,  Math.min(cy, rect.top + rect.height));
+  const dx = cx - closestX, dy = cy - closestY;
+  return (dx*dx + dy*dy) < (cr*cr);
+}
+
+// プレイヤー矩形を返す（描画基準に合わせる）
+function playerRect(){
+  return {
+    left: player.x - player.w/2,
+    top: player.y - player.h/2,
+    width: player.w,
+    height: player.h
+  };
+}
+
+// ---------------- 更新 ----------------
+function update(dt){
+  if(gameOver) return;
+
+  // パワーアップタイマー（以前の仕様維持）
+  if(player.powerUpTime > 0){
+    player.powerUpTime -= dt;
+    if(player.powerUpTime <= 0) player.powerUpTime = 0;
+  }
+
+  // 移動
+  if(keys["ArrowLeft"] || keys["a"]) player.x -= player.speed * dt;
+  if(keys["ArrowRight"] || keys["d"]) player.x += player.speed * dt;
+  player.x = Math.max(player.w/2, Math.min(W-player.w/2, player.x));
+
+  // 出現
+  if(Math.random() < 0.035) stones.push(spawnStone());
+
+  // 現在のプレイヤー当たり基準
+  const playerRectBounds = playerRect();
+  const playerCircle = { x: player.x, y: player.y, r: PLAYER_COLLISION_RADIUS };
+
+  // 各石を更新
+  for(let i=0;i<stones.length;i++){
+    const s = stones[i];
+    if(!s) continue;
+    s.x += s.vx * dt;
+    s.y += s.vy * dt;
+    s.rot += s.rotSpd * dt;
+
+    // 画面外削除（縦落下で即死はさせない仕様）
+    if(s.x < -100 || s.x > W+100 || s.y > H + 200){
+      s._remove = true;
+      continue;
+    }
+
+    // 判定：モードに応じて判定方法を選ぶ
+    let isNowColliding = false;
+    if(COLLISION_MODE === "circle"){
+      // 石は円、プレイヤーも円
+      isNowColliding = circleCircleCollision(s.x, s.y, s.r, playerCircle.x, playerCircle.y, playerCircle.r);
+    } else {
+      // rect モード: stone 円 vs player 矩形（最近接点）
+      isNowColliding = circleRectCollision(s.x, s.y, s.r, playerRectBounds);
+    }
+
+    // ヒステリシス（時間ベース）
+    if(isNowColliding){
+      s.hitTimer += dt;
+    } else {
+      s.hitTimer = 0;
+    }
+
+    // 判定確定：hitTimer が閾値を超え、かつプレイヤーがパワーアップしていないとゲームオーバー
+    if(s.hitTimer >= HIT_CONFIRM_TIME){
+      if(s.type === 'gold'){
+        player.powerUpTime = 6.0;
+        score += 500;
+        s._remove = true;
+        s.hitTimer = 0;
+        continue;
+      }
+      if(player.powerUpTime > 0){
+        // パワーアップ中は弾く
+        const diffX = s.x - player.x;
+        s.vx = diffX * 10;
+        s.vy = -Math.abs(s.vy) * 1.4;
+        s.isHitted = true;
+        score += 10;
+        s.hitTimer = 0; // 弾いたら判定リセット
+        continue;
+      }
+      // 当たり確定 → ゲームオーバー
+      gameOver = true;
+      running = false;
+      document.getElementById("msg").style.display = "block";
+      return;
+    }
+
+    // 隕石同士の衝突（弾いたもののみ）
+    if(s.isHitted && !s._remove){
+      for(let j=0;j<stones.length;j++){
+        if(i===j) continue;
+        const o = stones[j];
+        if(!o || o._remove) continue;
+        if(circleCircleCollision(s.x,s.y,s.r, o.x,o.y,o.r)){
+          s._remove = true; o._remove = true; score += 150; break;
+        }
+      }
+    }
+  }
+
+  // 一括削除
+  stones = stones.filter(s => !s._remove);
+
+  // HUD
+  document.getElementById("hud").textContent = "Score: " + Math.floor(score);
+}
+
+// ---------------- 描画（デバッグ付き） ----------------
+function draw(){
+  ctx.clearRect(0,0,W,H);
+
+  // 隕石
+  stones.forEach(s=>{
+    ctx.save();
+    ctx.translate(s.x, s.y);
+    ctx.rotate(s.rot);
+
+    if(s.type === 'gold'){
+      ctx.fillStyle = "#ffd700"; ctx.beginPath(); ctx.arc(0,0,s.r,0,Math.PI*2); ctx.fill();
+    } else {
+      if(s.img && s.img.complete){
+        ctx.drawImage(s.img, -s.size/2, -s.size/2, s.size, s.size);
+      } else {
+        ctx.beginPath(); ctx.fillStyle = s.isHitted ? "#00ccff" : "#888"; ctx.arc(0,0,s.r,0,Math.PI*2); ctx.fill();
+      }
+    }
+
+    // debug: hitTimer 表示
+    if(DEBUG){
+      ctx.fillStyle = "#fff"; ctx.font = "12px monospace"; ctx.fillText((s.hitTimer).toFixed(2), -s.size/2, -s.size/2 - 6);
+    }
+    ctx.restore();
+  });
+
+  // プレイヤー
+  ctx.save();
+  if(player.powerUpTime > 0){
+    ctx.shadowBlur = 30; ctx.shadowColor = "#ff0066";
+  } else ctx.shadowBlur = 0;
+
+  if(imgRocket && imgRocket.complete){
+    ctx.drawImage(imgRocket, player.x - player.w/2, player.y - player.h/2, player.w, player.h);
+  } else {
+    ctx.fillStyle = player.powerUpTime > 0 ? "#ff0066" : "#0099ff";
+    ctx.fillRect(player.x - player.w/2, player.y - player.h/2, player.w, player.h);
+  }
+  ctx.restore();
+
+  // デバッグ: 判定領域を描画
+  if(DEBUG){
+    // プレイヤー矩形
+    const pr = playerRect();
+    ctx.save();
+    ctx.setLineDash([4,3]);
+    ctx.strokeStyle = "lime";
+    ctx.strokeRect(pr.left, pr.top, pr.width, pr.height);
+    ctx.setLineDash([]);
+    ctx.restore();
+
+    // プレイヤー円（もし circle モードなら）
+    if(COLLISION_MODE === "circle"){
+      ctx.beginPath();
+      ctx.strokeStyle = "cyan";
+      ctx.arc(player.x, player.y, PLAYER_COLLISION_RADIUS, 0, Math.PI*2);
+      ctx.stroke();
+    }
+
+    // 各石の判定円
+    stones.forEach(s=>{
+      ctx.beginPath();
+      ctx.strokeStyle = s.hitTimer > 0 ? "red" : "rgba(255,255,255,0.15)";
+      ctx.arc(s.x, s.y, s.r, 0, Math.PI*2);
+      ctx.stroke();
+    });
+  }
+}
+
+// ---------------- ループ ----------------
+function loop(t){
+  if(!running) return;
+  const dt = Math.min((t-last)/1000, 0.1);
+  last = t;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+last = performance.now();
+loop(last);
+</script>
+</body>
+</html>
