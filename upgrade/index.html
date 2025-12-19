@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Asteroid Chain Reaction — 判定書き直し版</title>
+<title>Asteroid Chain Reaction — 判定書き直し版（安全描画）</title>
 <style>
   html,body{height:100%;margin:0;background:#05070b;display:flex;align-items:center;justify-content:center;font-family:system-ui;overflow:hidden;}
   canvas{background:#0a121d;border-radius:8px;box-shadow:0 0 30px rgba(0,150,255,0.2);cursor:crosshair;}
@@ -19,34 +19,59 @@
 
 <script>
 // ---------------- CONFIG ----------------
-// 衝突判定モード: "circle" または "rect"（rect は circle-rect 最近接点法）
-const COLLISION_MODE = "circle"; // 推奨: "circle"
-// プレイヤー円の半径（circle モードの当たり範囲。見た目に合わせて小さめに）
+const COLLISION_MODE = "circle"; // "circle" or "rect"
 const PLAYER_COLLISION_RADIUS = 18;
-
-// 衝突が有効になる「連続時間」(秒)。短すぎると誤判定、長すぎると反応鈍く。
-const HIT_CONFIRM_TIME = 0.06; // 60ms
-
-// デバッグ表示(true)をfalseに
+const HIT_CONFIRM_TIME = 0.06; // seconds
 const DEBUG = false;
+
+// 画像ベースパス（環境に合わせて変更してください）
+const IMAGE_BASE = "./images/";
 
 // ---------------- 基本 ----------------
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
 const W = canvas.width, H = canvas.height;
-let last = 0, running = true;
+let last = 0, running = false;
 let score = 0;
 let gameOver = false;
 
-// 画像（任意）
-const imgRocket = new Image();
-const imgStone1 = new Image();
-const imgStone2 = new Image();
-imgRocket.src = "/upgrade/images/rocket.png";
-imgStone1.src = "/upgrade/images/inseki01.png";
-imgStone2.src = "/upgrade/images/inseki02.png";
+// ---------------- 画像プリロードユーティリティ ----------------
+function loadImage(src, timeout = 5000) {
+  return new Promise(resolve => {
+    const img = new Image();
+    let done = false;
+    const finish = (obj) => { if(!done){ done = true; resolve(obj); } };
+    const to = setTimeout(()=> finish({ img, ok: false, src, reason: 'timeout' }), timeout);
+    img.onload = () => { clearTimeout(to); finish({ img, ok: true, src }); };
+    img.onerror = (e) => { clearTimeout(to); console.warn("image load error", src, e); finish({ img, ok: false, src, reason: 'error' }); };
+    img.src = src;
+  });
+}
 
-// プレイヤー（描画は矩形中心だが判定はモードに依る）
+// IMG オブジェクトにプリロード結果を入れる
+const IMG = {
+  rocket: { img: null, ok: false },
+  s1:     { img: null, ok: false },
+  s2:     { img: null, ok: false }
+};
+
+async function preloadAll() {
+  const p = await Promise.all([
+    loadImage(IMAGE_BASE + "rocket.png"),
+    loadImage(IMAGE_BASE + "inseki01.png"),
+    loadImage(IMAGE_BASE + "inseki02.png")
+  ]);
+  IMG.rocket = p[0];
+  IMG.s1     = p[1];
+  IMG.s2     = p[2];
+
+  console.log("Image preload:", { rocket: IMG.rocket.ok, s1: IMG.s1.ok, s2: IMG.s2.ok });
+
+  // 開始
+  startGameLoop();
+}
+
+// ---------------- ゲームデータ ----------------
 const player = {
   x: W/2, y: H - 80,
   w: 48, h: 48,
@@ -54,15 +79,14 @@ const player = {
   powerUpTime: 0
 };
 
-// stones 配列の要素に以下を持たせる:
-// { x,y,r,vx,vy,rot,rotSpd,img,size,type,isHitted,_remove,hitTimer }
-// hitTimer: 当該フレームから何秒間継続して当たり状態か（連続時間）
 let stones = [];
 const stoneTypes = [
-  { img: imgStone1, size: 42, speedMin: 90, speedMax: 160, type:'normal' },
-  { img: imgStone2, size: 66, speedMin: 60, speedMax: 130, type:'normal' },
-  { img: null,    size: 30, speedMin: 180, speedMax: 240, type:'gold' }
+  { ref: "s1", size: 42, speedMin: 90, speedMax: 160, type: 'normal' },
+  { ref: "s2", size: 66, speedMin: 60, speedMax: 130, type: 'normal' },
+  { ref: null, size: 30, speedMin: 180, speedMax: 240, type: 'gold' }
 ];
+
+function rand(a,b){ return Math.random()*(b-a)+a; }
 
 function spawnStone(){
   const r = Math.random();
@@ -76,20 +100,20 @@ function spawnStone(){
     vy: rand(type.speedMin, type.speedMax),
     rot: Math.random()*Math.PI*2,
     rotSpd: (Math.random()-0.5)*5,
-    img: type.img,
+    imgRef: type.ref, // "s1"/"s2" or null for gold
     size: type.size,
     type: type.type,
     isHitted: false,
     _remove: false,
-    hitTimer: 0 // ← ここが重要（当たり連続時間）
+    hitTimer: 0
   };
 }
-function rand(a,b){ return Math.random()*(b-a)+a; }
 
-// 入力
+// ---------------- 入力 ----------------
 const keys = {};
 window.addEventListener("keydown", e=>{ keys[e.key]=true; });
 window.addEventListener("keyup", e=>{ keys[e.key]=false; });
+
 canvas.addEventListener("mousemove", e=>{
   const r = canvas.getBoundingClientRect();
   const mx = (e.clientX - r.left) * (canvas.width / r.width);
@@ -97,63 +121,49 @@ canvas.addEventListener("mousemove", e=>{
 });
 canvas.addEventListener("mousedown", ()=>{ if(gameOver) restart(); });
 
-// リスタート
+// ---------------- 再スタート ----------------
 function restart(){
   stones = []; score = 0; player.powerUpTime = 0; gameOver = false;
-  document.getElementById("msg").style.display = "none"; last = performance.now(); running = true; loop(last);
+  document.getElementById("msg").style.display = "none";
+  last = performance.now();
+  running = true;
+  loop(last);
 }
 
-// ---------------- 判定関数（きれい） ----------------
-
-// 1) 円-円（石 vs プレイヤー円）
+// ---------------- 判定ユーティリティ ----------------
 function circleCircleCollision(ax,ay,ar, bx,by,br){
   const dx = ax-bx, dy = ay-by;
   return (dx*dx + dy*dy) < (ar+br)*(ar+br);
 }
 
-// 2) 円-矩形（石 vs プレイヤー矩形）
-//  矩形は left,top,width,height
 function circleRectCollision(cx,cy,cr, rect){
-  // 矩形の最近接点を求める
   const closestX = Math.max(rect.left, Math.min(cx, rect.left + rect.width));
-  const closestY = Math.max(rect.top,  Math.min(cy, rect.top + rect.height));
+  const closestY = Math.max(rect.top, Math.min(cy, rect.top + rect.height));
   const dx = cx - closestX, dy = cy - closestY;
   return (dx*dx + dy*dy) < (cr*cr);
 }
 
-// プレイヤー矩形を返す（描画基準に合わせる）
 function playerRect(){
-  return {
-    left: player.x - player.w/2,
-    top: player.y - player.h/2,
-    width: player.w,
-    height: player.h
-  };
+  return { left: player.x - player.w/2, top: player.y - player.h/2, width: player.w, height: player.h };
 }
 
 // ---------------- 更新 ----------------
 function update(dt){
   if(gameOver) return;
 
-  // パワーアップタイマー（以前の仕様維持）
   if(player.powerUpTime > 0){
-    player.powerUpTime -= dt;
-    if(player.powerUpTime <= 0) player.powerUpTime = 0;
+    player.powerUpTime = Math.max(0, player.powerUpTime - dt);
   }
 
-  // 移動
   if(keys["ArrowLeft"] || keys["a"]) player.x -= player.speed * dt;
   if(keys["ArrowRight"] || keys["d"]) player.x += player.speed * dt;
   player.x = Math.max(player.w/2, Math.min(W-player.w/2, player.x));
 
-  // 出現
   if(Math.random() < 0.035) stones.push(spawnStone());
 
-  // 現在のプレイヤー当たり基準
-  const playerRectBounds = playerRect();
-  const playerCircle = { x: player.x, y: player.y, r: PLAYER_COLLISION_RADIUS };
+  const pRect = playerRect();
+  const pCircle = { x: player.x, y: player.y, r: PLAYER_COLLISION_RADIUS };
 
-  // 各石を更新
   for(let i=0;i<stones.length;i++){
     const s = stones[i];
     if(!s) continue;
@@ -161,30 +171,20 @@ function update(dt){
     s.y += s.vy * dt;
     s.rot += s.rotSpd * dt;
 
-    // 画面外削除（縦落下で即死はさせない仕様）
     if(s.x < -100 || s.x > W+100 || s.y > H + 200){
       s._remove = true;
       continue;
     }
 
-    // 判定：モードに応じて判定方法を選ぶ
-    let isNowColliding = false;
+    let colliding = false;
     if(COLLISION_MODE === "circle"){
-      // 石は円、プレイヤーも円
-      isNowColliding = circleCircleCollision(s.x, s.y, s.r, playerCircle.x, playerCircle.y, playerCircle.r);
+      colliding = circleCircleCollision(s.x, s.y, s.r, pCircle.x, pCircle.y, pCircle.r);
     } else {
-      // rect モード: stone 円 vs player 矩形（最近接点）
-      isNowColliding = circleRectCollision(s.x, s.y, s.r, playerRectBounds);
+      colliding = circleRectCollision(s.x, s.y, s.r, pRect);
     }
 
-    // ヒステリシス（時間ベース）
-    if(isNowColliding){
-      s.hitTimer += dt;
-    } else {
-      s.hitTimer = 0;
-    }
+    if(colliding) s.hitTimer += dt; else s.hitTimer = 0;
 
-    // 判定確定：hitTimer が閾値を超え、かつプレイヤーがパワーアップしていないとゲームオーバー
     if(s.hitTimer >= HIT_CONFIRM_TIME){
       if(s.type === 'gold'){
         player.powerUpTime = 6.0;
@@ -194,23 +194,20 @@ function update(dt){
         continue;
       }
       if(player.powerUpTime > 0){
-        // パワーアップ中は弾く
         const diffX = s.x - player.x;
         s.vx = diffX * 10;
         s.vy = -Math.abs(s.vy) * 1.4;
         s.isHitted = true;
         score += 10;
-        s.hitTimer = 0; // 弾いたら判定リセット
+        s.hitTimer = 0;
         continue;
       }
-      // 当たり確定 → ゲームオーバー
       gameOver = true;
       running = false;
       document.getElementById("msg").style.display = "block";
       return;
     }
 
-    // 隕石同士の衝突（弾いたもののみ）
     if(s.isHitted && !s._remove){
       for(let j=0;j<stones.length;j++){
         if(i===j) continue;
@@ -223,14 +220,26 @@ function update(dt){
     }
   }
 
-  // 一括削除
   stones = stones.filter(s => !s._remove);
-
-  // HUD
   document.getElementById("hud").textContent = "Score: " + Math.floor(score);
 }
 
-// ---------------- 描画（デバッグ付き） ----------------
+// ---------------- 描画（安全に drawImage） ----------------
+function safeDrawImage(imgEntry, dx, dy, dw, dh){
+  // imgEntry is { img, ok } from preload or HTMLImageElement
+  let img = null, ok = false;
+  if(imgEntry && imgEntry.img !== undefined){
+    img = imgEntry.img; ok = !!imgEntry.ok;
+  } else {
+    img = imgEntry; ok = !!(img && img.complete && img.naturalWidth > 0);
+  }
+  if(ok && img && img.complete && img.naturalWidth > 0){
+    ctx.drawImage(img, dx, dy, dw, dh);
+    return true;
+  }
+  return false;
+}
+
 function draw(){
   ctx.clearRect(0,0,W,H);
 
@@ -243,14 +252,12 @@ function draw(){
     if(s.type === 'gold'){
       ctx.fillStyle = "#ffd700"; ctx.beginPath(); ctx.arc(0,0,s.r,0,Math.PI*2); ctx.fill();
     } else {
-      if(s.img && s.img.complete){
-        ctx.drawImage(s.img, -s.size/2, -s.size/2, s.size, s.size);
-      } else {
+      const ref = s.imgRef === "s2" ? IMG.s2 : IMG.s1;
+      if(!safeDrawImage(ref, -s.size/2, -s.size/2, s.size, s.size)){
         ctx.beginPath(); ctx.fillStyle = s.isHitted ? "#00ccff" : "#888"; ctx.arc(0,0,s.r,0,Math.PI*2); ctx.fill();
       }
     }
 
-    // debug: hitTimer 表示
     if(DEBUG){
       ctx.fillStyle = "#fff"; ctx.font = "12px monospace"; ctx.fillText((s.hitTimer).toFixed(2), -s.size/2, -s.size/2 - 6);
     }
@@ -259,44 +266,18 @@ function draw(){
 
   // プレイヤー
   ctx.save();
-  if(player.powerUpTime > 0){
-    ctx.shadowBlur = 30; ctx.shadowColor = "#ff0066";
-  } else ctx.shadowBlur = 0;
-
-  if(imgRocket && imgRocket.complete){
-    ctx.drawImage(imgRocket, player.x - player.w/2, player.y - player.h/2, player.w, player.h);
-  } else {
+  if(player.powerUpTime > 0){ ctx.shadowBlur = 30; ctx.shadowColor = "#ff0066"; } else ctx.shadowBlur = 0;
+  if(!safeDrawImage(IMG.rocket, player.x - player.w/2, player.y - player.h/2, player.w, player.h)){
     ctx.fillStyle = player.powerUpTime > 0 ? "#ff0066" : "#0099ff";
     ctx.fillRect(player.x - player.w/2, player.y - player.h/2, player.w, player.h);
   }
   ctx.restore();
 
-  // デバッグ: 判定領域を描画
   if(DEBUG){
-    // プレイヤー矩形
     const pr = playerRect();
-    ctx.save();
-    ctx.setLineDash([4,3]);
-    ctx.strokeStyle = "lime";
-    ctx.strokeRect(pr.left, pr.top, pr.width, pr.height);
-    ctx.setLineDash([]);
-    ctx.restore();
-
-    // プレイヤー円（もし circle モードなら）
-    if(COLLISION_MODE === "circle"){
-      ctx.beginPath();
-      ctx.strokeStyle = "cyan";
-      ctx.arc(player.x, player.y, PLAYER_COLLISION_RADIUS, 0, Math.PI*2);
-      ctx.stroke();
-    }
-
-    // 各石の判定円
-    stones.forEach(s=>{
-      ctx.beginPath();
-      ctx.strokeStyle = s.hitTimer > 0 ? "red" : "rgba(255,255,255,0.15)";
-      ctx.arc(s.x, s.y, s.r, 0, Math.PI*2);
-      ctx.stroke();
-    });
+    ctx.save(); ctx.setLineDash([4,3]); ctx.strokeStyle = "lime"; ctx.strokeRect(pr.left, pr.top, pr.width, pr.height); ctx.setLineDash([]); ctx.restore();
+    if(COLLISION_MODE === "circle"){ ctx.beginPath(); ctx.strokeStyle = "cyan"; ctx.arc(player.x, player.y, PLAYER_COLLISION_RADIUS, 0, Math.PI*2); ctx.stroke(); }
+    stones.forEach(s=>{ ctx.beginPath(); ctx.strokeStyle = s.hitTimer > 0 ? "red" : "rgba(255,255,255,0.15)"; ctx.arc(s.x, s.y, s.r, 0, Math.PI*2); ctx.stroke(); });
   }
 }
 
@@ -309,8 +290,22 @@ function loop(t){
   draw();
   requestAnimationFrame(loop);
 }
-last = performance.now();
-loop(last);
+
+function startGameLoop(){
+  last = performance.now();
+  running = true;
+  loop(last);
+}
+
+// プリロードして開始
+preloadAll().catch(e=>{
+  console.error("preloadAll failed:", e);
+  // それでもゲームを開始したい場合
+  startGameLoop();
+});
+
+// デバッグ用アクセス
+window.__GAME = { IMG, restart };
 </script>
 </body>
 </html>
