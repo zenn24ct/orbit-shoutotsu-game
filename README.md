@@ -10,7 +10,8 @@
 - 隕石は上からランダムに落下
 - マウスまたはキーボードで左右移動
 - 当たり判定は円ベースで安定化済み
-[normal ver](https://zenn24ct.github.io/orbit-shoutotsu-game/normal)
+
+- [normal verリンク](https://zenn24ct.github.io/orbit-shoutotsu-game/normal)
 
 ---
 
@@ -20,7 +21,8 @@
 - 無敵中は隕石に当たってもゲームオーバーにならない
 - 視覚エフェクト付き無敵状態
 - 今後さらに機能を追加予定
-[upgrade ver](https://zenn24ct.github.io/orbit-shoutotsu-game/upgrade)
+
+- [upgrade verリンク](https://zenn24ct.github.io/orbit-shoutotsu-game/upgrade)
 
 
 ---
