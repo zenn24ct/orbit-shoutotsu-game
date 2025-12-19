@@ -1,10 +1,9 @@
 ### Asteroid Chain Reaction
-
 シンプルなブラウザゲームです。  
 隕石を避けながらスコアを稼ぎます。
-
+（今思えば全然orbit gameじゃない。orbit gameちゃんと作ります。本当に作りたいから）
 ---
-
+![game screenshot](/images/screenshot.png)
 ##### normal ver
 - 基本的なゲームバージョン
 - プレイヤーが隕石に当たるとゲームオーバー
